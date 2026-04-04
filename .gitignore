@@ -1,0 +1,8 @@
+/data
+/get_text_data
+/__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pt
+/checkpoints
