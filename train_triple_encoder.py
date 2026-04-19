@@ -19,7 +19,7 @@ from triple_encoder.store import EmbeddingStore
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train tri-modal CLIP model")
-    parser.add_argument("--embeddings-root", type=str, default="data/embeddings")
+    parser.add_argument("--embeddings-root", type=str, default="data")
     parser.add_argument("--store-db", type=str, default="data/embeddings/embeddings.sqlite")
     parser.add_argument("--rebuild-store", action="store_true")
     parser.add_argument("--batch-size", type=int, default=128)
@@ -31,8 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proj-dim", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--lambda-gt", type=float, default=1.0)
-    parser.add_argument("--lambda-gi", type=float, default=0.3)
-    parser.add_argument("--lambda-ti", type=float, default=0.3)
+    parser.add_argument("--lambda-gi", type=float, default=1.0)
+    parser.add_argument("--lambda-ti", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb-project", type=str, default="geo-text-triple-encoder")

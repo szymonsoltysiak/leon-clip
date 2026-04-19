@@ -289,6 +289,11 @@ class EmbeddingStore:
 
     def build_from_embeddings_root(self, embeddings_root: str | Path, rebuild: bool = False) -> Dict[str, int]:
         root = Path(embeddings_root)
+        modality_dirs = ("text_embeddings", "image_embeddings", "graph_embeddings")
+        if not any((root / name).exists() for name in modality_dirs):
+            parent = root.parent
+            if any((parent / name).exists() for name in modality_dirs):
+                root = parent
         if rebuild:
             self.clear()
 
@@ -310,4 +315,6 @@ class EmbeddingStore:
                 dims[modality] = first_dim
 
         self.commit()
+        if not dims:
+            raise ValueError(f"No embeddings found under {root}")
         return dims
