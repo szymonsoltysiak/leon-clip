@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import math
 import random
+from functools import partial
+from collections import deque
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
 import h3
@@ -13,43 +17,103 @@ from .store import EmbeddingStore
 
 
 class H3TripleDataset(Dataset):
+    """Construct tri-modal triples anchored on H3 cells.
+
+    Text and graph features are hierarchical: the returned tensor concatenates
+    parent, center, and pooled child embeddings. Image features remain
+    non-hierarchical and use the exact center-cell image embedding only.
+    """
+
     def __init__(
         self,
         store: EmbeddingStore,
         target_resolutions: tuple[int, ...] = (7, 8, 9),
+        ancestor_resolutions: tuple[int, ...] = (7,),
         hierarchy_for: tuple[str, ...] = ("text", "graph"),
         embedding_sample_strategy: str = "random",
         mask_value: float = 0.0,
         dtype: torch.dtype = torch.float32,
     ) -> None:
-        self.store = store
-        self.target_resolutions = tuple(sorted({int(r) for r in target_resolutions}))
+        self._store_path = Path(store.db_path)
+        self.target_resolutions = tuple(sorted({int(resolution) for resolution in target_resolutions}))
         if not self.target_resolutions:
             raise ValueError("target_resolutions cannot be empty")
+        self.ancestor_resolutions = tuple(sorted({int(resolution) for resolution in ancestor_resolutions}))
+        for resolution in self.ancestor_resolutions:
+            if resolution < 0 or resolution > 15:
+                raise ValueError(f"Invalid ancestor resolution: {resolution}")
+
         self.hierarchy_for = set(hierarchy_for)
         self.embedding_sample_strategy = str(embedding_sample_strategy)
         if self.embedding_sample_strategy not in {"random", "first", "mean"}:
             raise ValueError("embedding_sample_strategy must be one of: random, first, mean")
+
         self.mask_value = float(mask_value)
         self.dtype = dtype
 
-        self.text_dim = self.store.get_dim("text") or 1
-        self.image_dim = self.store.get_dim("image") or 1
-        self.graph_dim = self.store.get_dim("graph") or 1
+        self.text_dim = store.get_dim("text") or 1
+        self.image_dim = store.get_dim("image") or 1
+        self.graph_dim = store.get_dim("graph") or 1
 
-        self.h3_ids = self.store.get_h3_ids(target_resolutions=self.target_resolutions)
+        self.h3_ids = store.get_h3_ids(target_resolutions=self.target_resolutions)
+        self._modality_cells: Dict[str, set[str]] = {
+            "text": store.get_cells_for_modality("text"),
+            "image": store.get_cells_for_modality("image"),
+            "graph": store.get_cells_for_modality("graph"),
+        }
+        self._h3_resolution: Dict[str, int] = {h3_id: int(h3.get_resolution(h3_id)) for h3_id in self.h3_ids}
+        self._parent_map: Dict[str, Optional[str]] = {}
+        self._children_map: Dict[str, tuple[str, ...]] = {}
+        self._ancestor_map: Dict[str, Dict[int, str]] = {}
 
-        self._text_h3 = set(self.store.get_h3_ids_for_modality("text", target_resolutions=self.target_resolutions))
-        self._image_h3 = set(self.store.get_h3_ids_for_modality("image", target_resolutions=self.target_resolutions))
-        self._graph_h3 = set(self.store.get_h3_ids_for_modality("graph", target_resolutions=self.target_resolutions))
+        for h3_id in self.h3_ids:
+            cell_resolution = self._h3_resolution[h3_id]
+            parent = str(h3.cell_to_parent(h3_id, cell_resolution - 1)) if cell_resolution > 0 else None
+            children = tuple(str(child) for child in h3.cell_to_children(h3_id, cell_resolution + 1)) if cell_resolution < 15 else ()
+            self._parent_map[h3_id] = parent
+            self._children_map[h3_id] = children
 
-        self.has_image_indices = [i for i, h in enumerate(self.h3_ids) if h in self._image_h3]
-        self.no_image_indices = [i for i, h in enumerate(self.h3_ids) if h not in self._image_h3]
+            ancestors: Dict[int, str] = {}
+            for resolution in self.ancestor_resolutions:
+                if resolution <= cell_resolution:
+                    ancestors[resolution] = h3_id if resolution == cell_resolution else str(h3.cell_to_parent(h3_id, resolution))
+            self._ancestor_map[h3_id] = ancestors
+
+        self._exact_presence_map: Dict[str, Dict[str, bool]] = {
+            "text": {h3_id: h3_id in self._modality_cells["text"] for h3_id in self.h3_ids},
+            "image": {h3_id: h3_id in self._modality_cells["image"] for h3_id in self.h3_ids},
+            "graph": {h3_id: h3_id in self._modality_cells["graph"] for h3_id in self.h3_ids},
+        }
+        self._hierarchy_presence_map: Dict[str, Dict[str, bool]] = {"text": {}, "graph": {}}
+        for modality in ("text", "graph"):
+            available_cells = self._modality_cells[modality]
+            for h3_id in self.h3_ids:
+                parent = self._parent_map[h3_id]
+                has_center = h3_id in available_cells
+                has_parent = parent is not None and parent in available_cells
+                has_child = any(child in available_cells for child in self._children_map[h3_id])
+                self._hierarchy_presence_map[modality][h3_id] = bool(has_center or has_parent or has_child)
+
+        self._image_h3_ids = {h3_id for h3_id in self.h3_ids if self._exact_presence_map["image"][h3_id]}
+        self.has_image_indices = [index for index, h3_id in enumerate(self.h3_ids) if h3_id in self._image_h3_ids]
+        self.no_image_indices = [index for index, h3_id in enumerate(self.h3_ids) if h3_id not in self._image_h3_ids]
 
         self._zero_cache: Dict[tuple[str, int], np.ndarray] = {}
+        self._embedding_cache: Dict[tuple[str, str], list[np.ndarray]] = {}
+        self._store: EmbeddingStore | None = None
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_store"] = None
+        return state
 
     def __len__(self) -> int:
         return len(self.h3_ids)
+
+    def _get_store(self) -> EmbeddingStore:
+        if self._store is None:
+            self._store = EmbeddingStore(self._store_path)
+        return self._store
 
     def _zero(self, dim: int, key: str) -> np.ndarray:
         cache_key = (key, dim)
@@ -58,57 +122,69 @@ class H3TripleDataset(Dataset):
         return self._zero_cache[cache_key]
 
     def _get_or_zero(self, modality: str, h3_id: str, dim: int) -> np.ndarray:
-        vec = self.store.get_embedding(modality, h3_id, strategy=self.embedding_sample_strategy)
-        if vec is None:
+        vector = self._sample_embedding(modality, h3_id, dim)
+        if vector is None:
             return self._zero(dim, f"{modality}_single")
-        if vec.shape[0] == dim:
-            return vec
-        out = self._zero(dim, f"{modality}_single").copy()
-        n = min(out.shape[0], vec.shape[0])
-        out[:n] = vec[:n]
-        return out
+        return vector
+
+    def _get_embeddings_cached(self, modality: str, h3_id: str) -> list[np.ndarray]:
+        cache_key = (modality, h3_id)
+        if cache_key in self._embedding_cache:
+            return self._embedding_cache[cache_key]
+        vectors = self._get_store().get_embeddings(modality, h3_id)
+        self._embedding_cache[cache_key] = vectors
+        return vectors
+
+    def _sample_embedding(self, modality: str, h3_id: Optional[str], dim: int) -> Optional[np.ndarray]:
+        if h3_id is None:
+            return None
+
+        vectors = self._get_embeddings_cached(modality, h3_id)
+        if not vectors:
+            return None
+
+        if self.embedding_sample_strategy == "first":
+            selected = vectors[0]
+        elif self.embedding_sample_strategy == "mean":
+            selected = np.mean(vectors, axis=0, dtype=np.float32)
+        elif self.embedding_sample_strategy == "random":
+            selected = random.choice(vectors)
+        else:
+            raise ValueError(f"Unknown embedding selection strategy: {self.embedding_sample_strategy}")
+
+        if selected.shape[0] != dim:
+            raise ValueError(
+                f"Stored {modality} embedding for {h3_id} has dimension {selected.shape[0]}, expected {dim}"
+            )
+        return selected
 
     def _hierarchical(self, modality: str, h3_id: str, dim: int) -> np.ndarray:
-        cell_res = h3.get_resolution(h3_id)
-        parent = h3.cell_to_parent(h3_id, cell_res - 1) if cell_res > 0 else None
-        children = list(h3.cell_to_children(h3_id, cell_res + 1)) if cell_res < 15 else []
+        parent = self._parent_map[h3_id]
+        children = self._children_map[h3_id]
 
-        vec_parent = self._get_or_zero(modality, parent, dim) if parent is not None else self._zero(dim, f"{modality}_parent")
-        vec_center = self._get_or_zero(modality, h3_id, dim)
+        parent_vec = self._get_or_zero(modality, parent, dim) if parent is not None else self._zero(dim, f"{modality}_parent")
+        center_vec = self._get_or_zero(modality, h3_id, dim)
 
-        child_vecs = [
-            self.store.get_embedding(modality, child, strategy=self.embedding_sample_strategy)
-            for child in children
-        ]
-        child_vecs = [v for v in child_vecs if v is not None and v.shape[0] > 0]
+        child_vecs = [self._sample_embedding(modality, child, dim) for child in children]
+        child_vecs = [vector for vector in child_vecs if vector is not None]
 
         if child_vecs:
-            pooled = np.mean(child_vecs, axis=0, dtype=np.float32)
-            if pooled.shape[0] != dim:
-                fixed = self._zero(dim, f"{modality}_child").copy()
-                n = min(dim, pooled.shape[0])
-                fixed[:n] = pooled[:n]
-                pooled = fixed
+            pooled_child = np.mean(child_vecs, axis=0, dtype=np.float32)
+            if pooled_child.shape[0] != dim:
+                raise ValueError(
+                    f"Stored {modality} child embeddings for {h3_id} have inconsistent dimensions: {pooled_child.shape[0]} vs {dim}"
+                )
         else:
-            pooled = self._zero(dim, f"{modality}_child")
+            pooled_child = self._zero(dim, f"{modality}_child")
 
-        return np.concatenate([vec_parent, vec_center, pooled], axis=0)
+        return np.concatenate([parent_vec, center_vec, pooled_child], axis=0)
 
     def _hierarchy_present(self, modality: str, h3_id: str) -> bool:
-        cell_res = h3.get_resolution(h3_id)
-        parent = h3.cell_to_parent(h3_id, cell_res - 1) if cell_res > 0 else None
-        children = h3.cell_to_children(h3_id, cell_res + 1) if cell_res < 15 else []
-        if self.store.has_embedding(modality, h3_id):
-            return True
-        if parent is not None and self.store.has_embedding(modality, parent):
-            return True
-        for child in children:
-            if self.store.has_embedding(modality, child):
-                return True
-        return False
+        return self._hierarchy_presence_map[modality][h3_id]
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         h3_id = self.h3_ids[idx]
+        h3_resolution = self._h3_resolution[h3_id]
 
         if "text" in self.hierarchy_for:
             text_vec = self._hierarchical("text", h3_id, self.text_dim)
@@ -121,23 +197,38 @@ class H3TripleDataset(Dataset):
             graph_vec = self._get_or_zero("graph", h3_id, self.graph_dim)
 
         image_vec = self._get_or_zero("image", h3_id, self.image_dim)
+        image_present = self._exact_presence_map["image"][h3_id]
 
-        has_text = self._hierarchy_present("text", h3_id)
-        has_image = self._hierarchy_present("image", h3_id)
-        has_graph = self._hierarchy_present("graph", h3_id)
+        text_present = self._hierarchy_present("text", h3_id) if "text" in self.hierarchy_for else self._exact_presence_map["text"][h3_id]
+        graph_present = self._hierarchy_present("graph", h3_id) if "graph" in self.hierarchy_for else self._exact_presence_map["graph"][h3_id]
 
-        return {
+        item: Dict[str, Any] = {
             "h3": h3_id,
+            "h3_resolution": torch.tensor(h3_resolution, dtype=torch.long),
             "text_embedding": torch.tensor(text_vec, dtype=self.dtype),
             "image_embedding": torch.tensor(image_vec, dtype=self.dtype),
             "graph_embedding": torch.tensor(graph_vec, dtype=self.dtype),
-            "text_present": torch.tensor(1 if has_text else 0, dtype=torch.bool),
-            "image_present": torch.tensor(1 if has_image else 0, dtype=torch.bool),
-            "graph_present": torch.tensor(1 if has_graph else 0, dtype=torch.bool),
+            "text_present": torch.tensor(text_present, dtype=torch.bool),
+            "image_present": torch.tensor(image_present, dtype=torch.bool),
+            "graph_present": torch.tensor(graph_present, dtype=torch.bool),
         }
+
+        for resolution in self.ancestor_resolutions:
+            ancestor_key = f"h3_parent_{resolution}"
+            item[ancestor_key] = self._ancestor_map[h3_id].get(resolution, "")
+
+        return item
 
 
 class ImageStratifiedBatchSampler(BatchSampler):
+    """Yield each item once per epoch while best-effort balancing image coverage.
+
+    The sampler consumes each index at most once per epoch. It shuffles the image
+    and non-image pools independently, then allocates image examples across the
+    epoch as evenly as possible so each batch reaches the requested image ratio
+    when enough image examples exist.
+    """
+
     def __init__(
         self,
         has_image_indices: list[int],
@@ -158,6 +249,8 @@ class ImageStratifiedBatchSampler(BatchSampler):
 
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if not 0.0 <= self.min_image_ratio <= 1.0:
+            raise ValueError("min_image_ratio must be between 0 and 1")
         if not self.all_indices:
             raise ValueError("sampler received no indices")
 
@@ -171,34 +264,51 @@ class ImageStratifiedBatchSampler(BatchSampler):
 
     def __iter__(self) -> Iterator[list[int]]:
         rng = random.Random(self.seed + self.epoch)
-        num_batches = len(self)
+        image_pool = deque(self.has_image_indices)
+        non_image_pool = deque(self.no_image_indices)
+        shuffled_images = list(image_pool)
+        shuffled_non_images = list(non_image_pool)
+        rng.shuffle(shuffled_images)
+        rng.shuffle(shuffled_non_images)
+        image_pool = deque(shuffled_images)
+        non_image_pool = deque(shuffled_non_images)
 
-        min_img = int(math.ceil(self.batch_size * self.min_image_ratio))
-        min_img = max(0, min(min_img, self.batch_size))
+        batch_sizes = [self.batch_size for _ in range(len(self))]
+        if batch_sizes and not self.drop_last:
+            batch_sizes[-1] = len(self.all_indices) - self.batch_size * (len(batch_sizes) - 1)
 
-        for _ in range(num_batches):
-            batch: list[int] = []
+        for batch_index, target_size in enumerate(batch_sizes):
+            remaining_batches = len(batch_sizes) - batch_index
+            required_images = min(target_size, int(math.ceil(target_size * self.min_image_ratio)))
+            fair_share = int(math.ceil(len(image_pool) / remaining_batches)) if remaining_batches else 0
+            image_take = min(required_images, fair_share, len(image_pool))
 
-            img_take = min_img
-            if not self.has_image_indices:
-                img_take = 0
+            batch: list[int] = [image_pool.popleft() for _ in range(image_take)]
+            remaining_slots = target_size - len(batch)
 
-            if img_take > 0:
-                if img_take <= len(self.has_image_indices):
-                    batch.extend(rng.sample(self.has_image_indices, img_take))
-                else:
-                    batch.extend(rng.choices(self.has_image_indices, k=img_take))
+            non_image_take = min(remaining_slots, len(non_image_pool))
+            batch.extend(non_image_pool.popleft() for _ in range(non_image_take))
+            remaining_slots -= non_image_take
 
-            remaining = self.batch_size - len(batch)
-            pool = self.all_indices
-            if remaining > 0:
-                if remaining <= len(pool):
-                    batch.extend(rng.sample(pool, remaining))
-                else:
-                    batch.extend(rng.choices(pool, k=remaining))
+            if remaining_slots > 0:
+                extra_image_take = min(remaining_slots, len(image_pool))
+                batch.extend(image_pool.popleft() for _ in range(extra_image_take))
+                remaining_slots -= extra_image_take
+
+            if remaining_slots > 0:
+                batch.extend(non_image_pool.popleft() for _ in range(min(remaining_slots, len(non_image_pool))))
 
             rng.shuffle(batch)
             yield batch
+
+
+def _seed_worker(worker_id: int, base_seed: int) -> None:
+    seed = base_seed + worker_id
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def build_dataloader(
@@ -208,6 +318,8 @@ def build_dataloader(
     num_workers: int = 0,
     drop_last: bool = False,
     seed: int = 42,
+    persistent_workers: Optional[bool] = None,
+    prefetch_factor: Optional[int] = None,
 ) -> DataLoader:
     sampler = ImageStratifiedBatchSampler(
         has_image_indices=dataset.has_image_indices,
@@ -218,9 +330,19 @@ def build_dataloader(
         seed=seed,
     )
 
-    return DataLoader(
-        dataset,
-        batch_sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
+    worker_init_fn = partial(_seed_worker, base_seed=seed) if num_workers > 0 else None
+
+    data_loader_kwargs: Dict[str, Any] = {
+        "dataset": dataset,
+        "batch_sampler": sampler,
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "worker_init_fn": worker_init_fn,
+    }
+
+    if num_workers > 0:
+        data_loader_kwargs["persistent_workers"] = bool(persistent_workers) if persistent_workers is not None else True
+        if prefetch_factor is not None:
+            data_loader_kwargs["prefetch_factor"] = int(prefetch_factor)
+
+    return DataLoader(**data_loader_kwargs)

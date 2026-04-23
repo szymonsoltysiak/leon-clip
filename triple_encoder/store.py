@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import pickle
 import random
 import sqlite3
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
 
@@ -31,8 +33,37 @@ def _to_numpy_1d(value: Any) -> Optional[np.ndarray]:
     return arr
 
 
+def _iter_numpy_vectors(value: Any) -> Iterator[np.ndarray]:
+    if value is None:
+        return
+    if isinstance(value, np.ndarray):
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.ndim == 1:
+            yield arr.reshape(-1)
+            return
+        if arr.ndim == 2:
+            for row in arr:
+                yield np.asarray(row, dtype=np.float32).reshape(-1)
+            return
+
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return
+        first = value[0]
+        if isinstance(first, (list, tuple, np.ndarray)):
+            for row in value:
+                vec = _to_numpy_1d(row)
+                if vec is not None:
+                    yield vec
+            return
+
+    vec = _to_numpy_1d(value)
+    if vec is not None:
+        yield vec
+
+
 def _first_existing_column(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
-    lower_to_original = {c.lower(): c for c in df.columns}
+    lower_to_original = {column.lower(): column for column in df.columns}
     for name in candidates:
         hit = lower_to_original.get(name.lower())
         if hit is not None:
@@ -45,18 +76,25 @@ def _normalize_target_resolutions(
     target_resolutions: Optional[Iterable[int]] = None,
 ) -> tuple[int, ...]:
     if target_resolutions is not None:
-        vals = sorted({int(r) for r in target_resolutions})
+        values = sorted({int(resolution) for resolution in target_resolutions})
     elif target_res is not None:
-        vals = [int(target_res)]
+        values = [int(target_res)]
     else:
-        vals = [8]
+        values = [8]
 
-    if not vals:
+    if not values:
         raise ValueError("At least one target resolution must be provided")
-    for r in vals:
-        if r < 0 or r > 15:
-            raise ValueError(f"Invalid H3 resolution: {r}")
-    return tuple(vals)
+    for resolution in values:
+        if resolution < 0 or resolution > 15:
+            raise ValueError(f"Invalid H3 resolution: {resolution}")
+    return tuple(values)
+
+
+def _is_valid_h3_cell(h3_id: str) -> bool:
+    try:
+        return bool(h3.is_valid_cell(h3_id))
+    except Exception:
+        return False
 
 
 class EmbeddingStore:
@@ -65,32 +103,34 @@ class EmbeddingStore:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path))
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self._conn = sqlite3.connect(str(self.db_path))
+        self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute("PRAGMA synchronous=NORMAL;")
         self._create_schema()
 
+    def __enter__(self) -> EmbeddingStore:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        return self._conn
+
     def close(self) -> None:
-        self.conn.close()
+        if self._conn is None:
+            return
+        try:
+            self._conn.commit()
+        finally:
+            self._conn.close()
+            self._conn = None  # type: ignore[assignment]
+
+    def commit(self) -> None:
+        self.conn.commit()
 
     def _create_schema(self) -> None:
-        if self._needs_embeddings_migration():
-            self.conn.executescript(
-                """
-                ALTER TABLE embeddings RENAME TO embeddings_old;
-                CREATE TABLE embeddings (
-                    sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    modality TEXT NOT NULL,
-                    h3 TEXT NOT NULL,
-                    dim INTEGER NOT NULL,
-                    vec BLOB NOT NULL
-                );
-                INSERT INTO embeddings(modality, h3, dim, vec)
-                SELECT modality, h3, dim, vec FROM embeddings_old;
-                DROP TABLE embeddings_old;
-                """
-            )
-
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS embeddings (
@@ -98,28 +138,90 @@ class EmbeddingStore:
                 modality TEXT NOT NULL,
                 h3 TEXT NOT NULL,
                 dim INTEGER NOT NULL,
+                vec_hash TEXT NOT NULL,
                 vec BLOB NOT NULL
             );
             CREATE TABLE IF NOT EXISTS dims (
                 modality TEXT PRIMARY KEY,
                 dim INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_embeddings_h3 ON embeddings(h3);
-            CREATE INDEX IF NOT EXISTS idx_embeddings_modality_h3 ON embeddings(modality, h3);
+            """
+        )
+        self._migrate_embeddings_schema_if_needed()
+        self._deduplicate_embeddings()
+        self.conn.execute("DROP INDEX IF EXISTS idx_embeddings_unique_modality_h3")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_unique_modality_h3_hash ON embeddings(modality, h3, vec_hash)"
+        )
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_embeddings_modality_h3 ON embeddings(modality, h3)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_embeddings_h3 ON embeddings(h3)")
+        self.conn.commit()
+
+    def _migrate_embeddings_schema_if_needed(self) -> None:
+        columns = {
+            row[1]: row
+            for row in self.conn.execute("PRAGMA table_info(embeddings)").fetchall()
+        }
+        if not columns:
+            return
+        if "vec_hash" in columns:
+            return
+
+        self.conn.executescript(
+            """
+            ALTER TABLE embeddings RENAME TO embeddings_legacy;
+            CREATE TABLE embeddings (
+                sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                modality TEXT NOT NULL,
+                h3 TEXT NOT NULL,
+                dim INTEGER NOT NULL,
+                vec_hash TEXT NOT NULL,
+                vec BLOB NOT NULL
+            );
+            """
+        )
+
+        rows = self.conn.execute(
+            "SELECT modality, h3, dim, vec FROM embeddings_legacy ORDER BY sample_id"
+        ).fetchall()
+        for modality, h3_id, dim, raw_vec in rows:
+            vec = np.frombuffer(raw_vec, dtype=np.float32)
+            if vec.shape[0] != int(dim):
+                continue
+            vec = np.asarray(vec, dtype=np.float32).reshape(-1)
+            vec_hash = self._vector_hash(vec)
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO embeddings(modality, h3, dim, vec_hash, vec)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (modality, h3_id, int(vec.shape[0]), vec_hash, sqlite3.Binary(vec.tobytes())),
+            )
+
+        self.conn.executescript(
+            """
+            DROP TABLE embeddings_legacy;
+            DROP INDEX IF EXISTS idx_embeddings_unique_modality_h3;
+            """
+        )
+
+    @staticmethod
+    def _vector_hash(vec: np.ndarray) -> str:
+        normalized = np.asarray(vec, dtype=np.float32).reshape(-1)
+        return hashlib.sha1(normalized.tobytes()).hexdigest()
+
+    def _deduplicate_embeddings(self) -> None:
+        self.conn.executescript(
+            """
+            DELETE FROM embeddings
+            WHERE sample_id NOT IN (
+                SELECT MIN(sample_id)
+                FROM embeddings
+                GROUP BY modality, h3, vec_hash
+            );
             """
         )
         self.conn.commit()
-
-    def _needs_embeddings_migration(self) -> bool:
-        table = self.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'embeddings'"
-        ).fetchone()
-        if table is None:
-            return False
-
-        cols = self.conn.execute("PRAGMA table_info(embeddings)").fetchall()
-        col_names = [str(c[1]) for c in cols]
-        return "sample_id" not in col_names
 
     def clear(self) -> None:
         self.conn.executescript(
@@ -130,67 +232,77 @@ class EmbeddingStore:
         )
         self.conn.commit()
 
-    def upsert_embedding(self, modality: str, h3_id: str, vec: np.ndarray) -> None:
-        arr = np.asarray(vec, dtype=np.float32)
-        self.conn.execute(
+    def insert_embedding(self, modality: str, h3_id: str, vec: np.ndarray) -> bool:
+        arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+        vec_hash = self._vector_hash(arr)
+        cursor = self.conn.execute(
             """
-            INSERT INTO embeddings(modality, h3, dim, vec)
-            VALUES (?, ?, ?, ?)
+            INSERT OR IGNORE INTO embeddings(modality, h3, dim, vec_hash, vec)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (modality, h3_id, int(arr.shape[0]), sqlite3.Binary(arr.tobytes())),
+            (modality, h3_id, int(arr.shape[0]), vec_hash, sqlite3.Binary(arr.tobytes())),
         )
+        return cursor.rowcount > 0
 
     def set_dim(self, modality: str, dim: int) -> None:
         self.conn.execute(
-            "INSERT OR REPLACE INTO dims(modality, dim) VALUES (?, ?)",
+            "INSERT INTO dims(modality, dim) VALUES (?, ?) ON CONFLICT(modality) DO UPDATE SET dim = excluded.dim",
             (modality, int(dim)),
         )
 
     def get_dim(self, modality: str) -> Optional[int]:
-        row = self.conn.execute(
-            "SELECT dim FROM dims WHERE modality = ?",
-            (modality,),
-        ).fetchone()
+        row = self.conn.execute("SELECT dim FROM dims WHERE modality = ?", (modality,)).fetchone()
         if row is None:
             return None
         return int(row[0])
 
+    def count_embeddings(self, modality: Optional[str] = None) -> int:
+        if modality is None:
+            row = self.conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()
+        else:
+            row = self.conn.execute("SELECT COUNT(*) FROM embeddings WHERE modality = ?", (modality,)).fetchone()
+        return int(row[0] if row is not None else 0)
+
     def get_embeddings(self, modality: str, h3_id: str) -> list[np.ndarray]:
         rows = self.conn.execute(
-            "SELECT dim, vec FROM embeddings WHERE modality = ? AND h3 = ?",
+            "SELECT dim, vec FROM embeddings WHERE modality = ? AND h3 = ? ORDER BY sample_id",
             (modality, h3_id),
         ).fetchall()
-        out: list[np.ndarray] = []
+        embeddings: list[np.ndarray] = []
         for dim, raw in rows:
-            vec = np.frombuffer(raw, dtype=np.float32)
-            if vec.shape[0] != int(dim):
+            vector = np.frombuffer(raw, dtype=np.float32)
+            if vector.shape[0] != int(dim):
                 continue
-            out.append(vec)
-        return out
+            embeddings.append(vector)
+        return embeddings
 
     def get_embedding(self, modality: str, h3_id: str, strategy: str = "random") -> Optional[np.ndarray]:
-        vecs = self.get_embeddings(modality, h3_id)
-        if not vecs:
+        vectors = self.get_embeddings(modality, h3_id)
+        if not vectors:
             return None
 
         if strategy == "first":
-            return vecs[0]
+            return vectors[0]
         if strategy == "mean":
-            return np.mean(vecs, axis=0, dtype=np.float32)
+            return np.mean(vectors, axis=0, dtype=np.float32)
         if strategy == "random":
-            return random.choice(vecs)
+            return random.choice(vectors)
         raise ValueError(f"Unknown embedding selection strategy: {strategy}")
 
     def _anchor_for_resolutions(self, h3_id: str, target_resolutions: tuple[int, ...]) -> Optional[str]:
-        res = h3.get_resolution(h3_id)
-        if res in target_resolutions:
+        if not _is_valid_h3_cell(h3_id):
+            return None
+
+        resolution = h3.get_resolution(h3_id)
+        if resolution in target_resolutions:
             return h3_id
 
-        lower = [r for r in target_resolutions if r <= res]
-        if not lower:
+        lower_resolutions = [candidate for candidate in target_resolutions if candidate <= resolution]
+        if not lower_resolutions:
             return None
-        target = max(lower)
-        if target == res:
+
+        target = max(lower_resolutions)
+        if target == resolution:
             return h3_id
         return h3.cell_to_parent(h3_id, target)
 
@@ -200,17 +312,12 @@ class EmbeddingStore:
         target_resolutions: Optional[Iterable[int]] = None,
     ) -> list[str]:
         targets = _normalize_target_resolutions(target_res=target_res, target_resolutions=target_resolutions)
-        rows = self.conn.execute(
-            "SELECT DISTINCT h3 FROM embeddings"
-        ).fetchall()
+        rows = self.conn.execute("SELECT DISTINCT h3 FROM embeddings").fetchall()
         output: set[str] = set()
         for (h3_id,) in rows:
-            try:
-                anchor = self._anchor_for_resolutions(h3_id, targets)
-                if anchor is not None:
-                    output.add(anchor)
-            except Exception:
-                continue
+            anchor = self._anchor_for_resolutions(h3_id, targets)
+            if anchor is not None:
+                output.add(anchor)
         return sorted(output)
 
     def get_h3_ids_for_modality(
@@ -220,19 +327,17 @@ class EmbeddingStore:
         target_resolutions: Optional[Iterable[int]] = None,
     ) -> list[str]:
         targets = _normalize_target_resolutions(target_res=target_res, target_resolutions=target_resolutions)
-        rows = self.conn.execute(
-            "SELECT h3 FROM embeddings WHERE modality = ?",
-            (modality,),
-        ).fetchall()
+        rows = self.conn.execute("SELECT h3 FROM embeddings WHERE modality = ?", (modality,)).fetchall()
         output: set[str] = set()
         for (h3_id,) in rows:
-            try:
-                anchor = self._anchor_for_resolutions(h3_id, targets)
-                if anchor is not None:
-                    output.add(anchor)
-            except Exception:
-                continue
+            anchor = self._anchor_for_resolutions(h3_id, targets)
+            if anchor is not None:
+                output.add(anchor)
         return sorted(output)
+
+    def get_cells_for_modality(self, modality: str) -> set[str]:
+        rows = self.conn.execute("SELECT DISTINCT h3 FROM embeddings WHERE modality = ?", (modality,)).fetchall()
+        return {str(h3_id) for (h3_id,) in rows}
 
     def has_embedding(self, modality: str, h3_id: str) -> bool:
         row = self.conn.execute(
@@ -240,9 +345,6 @@ class EmbeddingStore:
             (modality, h3_id),
         ).fetchone()
         return row is not None
-
-    def commit(self) -> None:
-        self.conn.commit()
 
     def _iter_text(self, folder: Path) -> Iterator[Tuple[str, np.ndarray]]:
         for parquet_path in sorted(folder.glob("*.parquet")):
@@ -256,15 +358,15 @@ class EmbeddingStore:
                 continue
             for raw_h3, raw_vec in zip(df[h3_col], df[emb_col], strict=False):
                 h3_id = _normalize_h3_key(raw_h3)
-                vec = _to_numpy_1d(raw_vec)
-                if h3_id is None or vec is None:
+                if h3_id is None:
                     continue
-                yield h3_id, vec
+                for vector in _iter_numpy_vectors(raw_vec):
+                    yield h3_id, vector
 
     def _iter_pickle(self, folder: Path) -> Iterator[Tuple[str, np.ndarray]]:
-        for pkl_path in sorted(folder.glob("*.pkl")):
+        for pickle_path in sorted(folder.glob("*.pkl")):
             try:
-                with pkl_path.open("rb") as handle:
+                with pickle_path.open("rb") as handle:
                     obj = pickle.load(handle)
             except Exception:
                 continue
@@ -282,10 +384,10 @@ class EmbeddingStore:
 
             for raw_h3, raw_vec in iterable:
                 h3_id = _normalize_h3_key(raw_h3)
-                vec = _to_numpy_1d(raw_vec)
-                if h3_id is None or vec is None:
+                if h3_id is None:
                     continue
-                yield h3_id, vec
+                for vector in _iter_numpy_vectors(raw_vec):
+                    yield h3_id, vector
 
     def build_from_embeddings_root(self, embeddings_root: str | Path, rebuild: bool = False) -> Dict[str, int]:
         root = Path(embeddings_root)
@@ -294,6 +396,7 @@ class EmbeddingStore:
             parent = root.parent
             if any((parent / name).exists() for name in modality_dirs):
                 root = parent
+
         if rebuild:
             self.clear()
 
@@ -305,14 +408,42 @@ class EmbeddingStore:
 
         dims: Dict[str, int] = {}
         for modality, iterator in modal_to_iter.items():
-            first_dim: Optional[int] = None
-            for h3_id, vec in iterator:
-                self.upsert_embedding(modality, h3_id, vec)
-                if first_dim is None:
-                    first_dim = int(vec.shape[0])
-            if first_dim is not None:
-                self.set_dim(modality, first_dim)
-                dims[modality] = first_dim
+            expected_dim: Optional[int] = None
+            inserted = 0
+            skipped_invalid_h3 = 0
+            skipped_dim_mismatch = 0
+            skipped_duplicate = 0
+
+            for h3_id, vector in iterator:
+                if not _is_valid_h3_cell(h3_id):
+                    skipped_invalid_h3 += 1
+                    continue
+
+                vector = np.asarray(vector, dtype=np.float32).reshape(-1)
+                if expected_dim is None:
+                    expected_dim = int(vector.shape[0])
+                elif int(vector.shape[0]) != expected_dim:
+                    skipped_dim_mismatch += 1
+                    continue
+
+                if not self.insert_embedding(modality, h3_id, vector):
+                    skipped_duplicate += 1
+                    continue
+                inserted += 1
+
+            if expected_dim is not None:
+                self.set_dim(modality, expected_dim)
+                dims[modality] = expected_dim
+
+            if skipped_invalid_h3 or skipped_dim_mismatch or skipped_duplicate:
+                warnings.warn(
+                    (
+                        f"{modality} ingestion summary: inserted={inserted}, "
+                        f"invalid_h3={skipped_invalid_h3}, dim_mismatch={skipped_dim_mismatch}, "
+                        f"duplicates={skipped_duplicate}"
+                    ),
+                    stacklevel=2,
+                )
 
         self.commit()
         if not dims:
