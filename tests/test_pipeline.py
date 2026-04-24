@@ -400,6 +400,9 @@ def test_retrieval_metrics_toy_example() -> None:
     )
     assert metrics["recall@1"] == 1.0
     assert metrics["mrr"] == 1.0
+    assert metrics["mge@1_km"] == 0.0
+    assert metrics["mge@5_km"] == 0.0
+    assert metrics["mge@10_km"] == 0.0
 
 
 def test_ema_update_changes_shadow() -> None:
