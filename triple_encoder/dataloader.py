@@ -112,7 +112,7 @@ class H3TripleDataset(Dataset):
 
     def _get_store(self) -> EmbeddingStore:
         if self._store is None:
-            self._store = EmbeddingStore(self._store_path)
+            self._store = EmbeddingStore(self._store_path, read_only=True, initialize_schema=False)
         return self._store
 
     def _zero(self, dim: int, key: str) -> np.ndarray:

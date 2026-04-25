@@ -100,13 +100,24 @@ def _is_valid_h3_cell(h3_id: str) -> bool:
 class EmbeddingStore:
     """SQLite-backed storage for text, image, and graph embeddings."""
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, read_only: bool = False, initialize_schema: bool = True) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA synchronous=NORMAL;")
-        self._create_schema()
+        self._read_only = bool(read_only)
+
+        if self._read_only:
+            if not self.db_path.exists():
+                raise FileNotFoundError(f"Read-only embedding store does not exist: {self.db_path}")
+            uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+            self._conn = sqlite3.connect(uri, uri=True)
+            self._conn.execute("PRAGMA query_only = ON;")
+        else:
+            self._conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+            self._conn.execute("PRAGMA journal_mode=WAL;")
+            self._conn.execute("PRAGMA synchronous=NORMAL;")
+            self._conn.execute("PRAGMA busy_timeout=30000;")
+            if initialize_schema:
+                self._create_schema()
 
     def __enter__(self) -> EmbeddingStore:
         return self

@@ -22,7 +22,13 @@ from triple_encoder.losses import (
 )
 from triple_encoder.model import HeadConfig, TriModalCLIP
 from triple_encoder.store import EmbeddingStore
-from train import ExponentialMovingAverage, apply_modality_dropout, build_optimizer, build_warmup_cosine_scheduler
+from train import (
+    ExponentialMovingAverage,
+    apply_image_embedding_noise,
+    apply_modality_dropout,
+    build_optimizer,
+    build_warmup_cosine_scheduler,
+)
 
 
 def _make_embeddings_root(root: Path) -> tuple[str, str]:
@@ -71,6 +77,19 @@ def test_store_ingestion_is_idempotent(tmp_path: Path) -> None:
     assert dims_second == dims_first
     assert count_after_first == 5
     assert count_after_second == count_after_first
+
+
+def test_store_can_be_reopened_read_only(tmp_path: Path) -> None:
+    root = tmp_path / "embeddings"
+    center, _ = _make_embeddings_root(root)
+
+    store = EmbeddingStore(tmp_path / "embeddings.sqlite")
+    store.build_from_embeddings_root(root, rebuild=False)
+    store.close()
+
+    read_only_store = EmbeddingStore(tmp_path / "embeddings.sqlite", read_only=True, initialize_schema=False)
+    assert read_only_store.count_embeddings() == 5
+    assert len(read_only_store.get_embeddings("text", center)) == 1
 
 
 def test_store_preserves_distinct_vectors_and_deduplicates_exact_duplicates(tmp_path: Path) -> None:
@@ -332,6 +351,27 @@ def test_modality_dropout_updates_effective_presence() -> None:
     assert stats["dropout/text_dropped"] == 2.0
     assert batch["text_present"].tolist() == [False, False, False]
     assert batch["text_present_raw"].tolist() == [True, True, False]
+
+
+def test_image_noise_updates_only_present_embeddings() -> None:
+    torch.manual_seed(123)
+    image = torch.zeros(3, 4)
+    batch = {
+        "image_embedding": image.clone(),
+        "image_present": torch.tensor([True, False, True]),
+    }
+    stats = apply_image_embedding_noise(
+        batch,
+        enabled=True,
+        noise_std=0.05,
+        training=True,
+    )
+
+    assert stats["noise/image_applied"] == 2.0
+    assert stats["noise/image_std"] == 0.05
+    assert torch.any(batch["image_embedding"][0] != 0)
+    assert torch.all(batch["image_embedding"][1] == 0)
+    assert torch.any(batch["image_embedding"][2] != 0)
 
 
 def test_missing_tokens_are_used_for_absent_modalities() -> None:

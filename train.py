@@ -90,6 +90,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--text-modality-dropout", type=float, default=0.1)
     parser.add_argument("--image-modality-dropout", type=float, default=0.05)
     parser.add_argument("--graph-modality-dropout", type=float, default=0.1)
+    parser.add_argument("--use-image-noise", action="store_true")
+    parser.add_argument("--image-noise-std", type=float, default=0.05)
 
     parser.add_argument("--loss-mode", type=str, default="multi_positive", choices=["single_positive", "multi_positive"])
     parser.add_argument("--allow-cross-resolution-positives", action="store_true", default=True)
@@ -294,6 +296,27 @@ def apply_modality_dropout(
     return stats
 
 
+def apply_image_embedding_noise(
+    batch: Dict[str, torch.Tensor],
+    *,
+    enabled: bool,
+    noise_std: float,
+    training: bool,
+) -> Dict[str, float]:
+    if not training or not enabled or noise_std <= 0.0:
+        return {"noise/image_applied": 0.0, "noise/image_std": float(noise_std)}
+
+    image_embedding = batch["image_embedding"]
+    image_present = batch["image_present"].unsqueeze(-1).to(dtype=image_embedding.dtype)
+    noise = torch.randn_like(image_embedding) * float(noise_std)
+    noise = noise * image_present
+    batch["image_embedding"] = image_embedding + noise
+    return {
+        "noise/image_applied": float(image_present.sum().item()),
+        "noise/image_std": float(noise_std),
+    }
+
+
 def collect_eval_embeddings(
     model: TriModalCLIP,
     dataloader: DataLoader,
@@ -484,6 +507,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "presence": asdict(presence_cfg),
                 "lr": args.lr,
                 "logit_scale_lr": args.logit_scale_lr,
+                "use_image_noise": args.use_image_noise,
+                "image_noise_std": args.image_noise_std,
                 "warmup_steps": warmup_steps,
                 "batch_size": args.batch_size,
             },
@@ -549,6 +574,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                         training=True,
                         generator=dropout_generator,
                     )
+                    image_noise_stats = apply_image_embedding_noise(
+                        batch_on_device,
+                        enabled=args.use_image_noise,
+                        noise_std=args.image_noise_std,
+                        training=model.training,
+                    )
 
                     model_out = model(
                         graph_embedding=batch_on_device["graph_embedding"],
@@ -585,6 +616,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "logit_scale": temp,
                         "grad_norm": grad_norm,
                         **dropout_stats,
+                        **image_noise_stats,
                         **loss_metrics,
                     }
                     if need_raw:
