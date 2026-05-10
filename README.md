@@ -171,6 +171,128 @@ Evaluation is intentionally configurable because retrieval metrics can be expens
 - `--max-eval-samples` bounds eval set size strictly,
 - `--eval-at-epoch-end` enables optional end-of-epoch eval.
 
+## Downstream Benchmarks
+
+The downstream benchmark runner evaluates whether projected tri-modal features are more useful for real predictive tasks than:
+
+- no embedding features at all,
+- raw pre-projection embeddings,
+- post-projection aligned embeddings from a trained checkpoint.
+
+This is a probe-style evaluation (not retrieval). It trains lightweight predictors on top of each feature representation and compares standard supervised metrics.
+
+### What the benchmark does
+
+For each selected task, the runner:
+
+1. loads and preprocesses tabular/geospatial labels,
+2. aligns rows to H3 cells available in `data/embeddings/embeddings.sqlite`,
+3. builds features under one of the feature modes,
+4. applies modality ablations via modality presence masks,
+5. trains a probe model and reports metrics,
+6. prints a console table and writes a JSON report.
+
+Feature modes:
+
+- `no_embeddings`: baseline task features only,
+- `pre_projection`: raw vectors from SQLite through `EmbeddingStore` + `H3TripleDataset`,
+- `post_projection`: vectors after `TriModalCLIP` projection heads from a checkpoint.
+
+Modality combinations:
+
+- all: `graph,text,image`
+- single: e.g. `graph`
+- pair: e.g. `graph,image`
+
+In post-projection mode, dropped modalities are simulated by masking `*_present` flags so the model uses its native missing-token handling.
+
+### Supported tasks
+
+- `airbnb`
+- `king_county`
+- `san_francisco_crime`
+- `chicago_crime`
+- `philadelphia_crime`
+- `beijing_housing`
+
+### Metrics
+
+Regression tasks report:
+
+- R2
+- MAE
+- RMSE
+- RMSLE (when valid)
+
+Classification tasks report:
+
+- Accuracy
+- F1 macro
+- Precision macro
+- Recall macro
+
+### Run benchmarks
+
+Single task, post-projection, selected modalities:
+
+```bash
+python run_downstream_benchmarks.py \
+  --task philadelphia_crime \
+  --feature-mode post_projection \
+  --modalities graph,image \
+  --checkpoint checkpoints/final_sota.pt
+```
+
+Single task, no-embeddings baseline:
+
+```bash
+python run_downstream_benchmarks.py \
+  --task king_county \
+  --feature-mode no_embeddings \
+  --modalities all
+```
+
+All tasks across all feature modes:
+
+```bash
+python run_downstream_benchmarks.py \
+  --task all \
+  --feature-mode all \
+  --modalities all \
+  --checkpoint checkpoints/final_sota.pt \
+  --output-json outputs/downstream_benchmarks/report.json
+```
+
+Useful flags:
+
+- `--store-db` (default: `data/embeddings/embeddings.sqlite`)
+- `--target-resolutions` (default: `7,8,9`)
+- `--ancestor-resolutions` (default: `7`)
+- `--embedding-sample-strategy {random,first,mean}`
+- `--batch-size`
+- `--use-ema` to load EMA weights from checkpoint when available
+- `--include-baseline-features` to combine task features with embedding features in `pre_projection` and `post_projection`
+- `--probe-model {ridge,mlp}` to switch between linear and nonlinear probes
+- `--mlp-hidden-layers` and `--mlp-max-iter` for MLP probe settings
+
+Old-style benchmark setup (similar to embedding+tabular MLP baselines):
+
+```bash
+python run_downstream_benchmarks.py \
+  --task philadelphia_crime \
+  --feature-mode pre_projection \
+  --modalities graph \
+  --include-baseline-features \
+  --probe-model mlp \
+  --mlp-hidden-layers 512,256 \
+  --mlp-max-iter 1000
+```
+
+### Notes
+
+- The benchmark module is self-contained in `triple_encoder/benchmarks/`.
+- Some tasks rely on external datasets (for example via `srai`, and `kagglehub` for `beijing_housing`).
+
 ## Sampler Behavior
 
 `ImageStratifiedBatchSampler` visits each example at most once per epoch. It shuffles image and non-image pools independently, then distributes image examples across the epoch as evenly as possible so each batch reaches the requested minimum image ratio when enough image samples exist.
@@ -293,3 +415,36 @@ pytest
 - Hard negatives are batch-local only (no global mining).
 - Retrieval evaluation is brute-force batch aggregation and can be memory intensive for very large validation sets.
 - Image features remain non-hierarchical.
+
+## Alignment Analysis Tools
+
+New small analysis utilities were added under the `alignment/` package and a thin CLI entrypoint to run them:
+
+- `alignment/registry.py`: a lazy `ModalityRegistry` that maps `image`, `text`, `graph`, or `all` to loader callables. It looks for common filenames under `data/<modality>_embeddings/` such as `post_projection.npy`, `post.npy`, `embeddings.npy` or their `.pt` equivalents.
+- `alignment/geometry.py`: stateless math utilities for covariance/eigendecomposition, isotropy, participation ratio (PR), uniformity (Gaussian kernel sums), haversine distances, and geographic correlation.
+- `alignment/visualize.py`: plotting helpers for eigenvalue spectra, multimodal t-SNE (or PCA fallback), and geographic density/trend plots.
+- `eval_alignment.py`: a CLI wrapper that ties the registry, math, and visualizers together.
+
+Usage examples (use the project's virtualenv):
+
+```bash
+source .venv/bin/activate
+python eval_alignment.py --modality graph --stage pre --plot
+python eval_alignment.py --modality graph --stage post --checkpoint checkpoints/final_sota.pt --plot
+python eval_alignment.py --modality all --stage post --checkpoint checkpoints/final_sota.pt --plot
+```
+
+The CLI now reuses the same data path as training: it opens `data/embeddings/embeddings.sqlite` via `EmbeddingStore`, constructs `H3TripleDataset`, and samples at most `--max-samples` rows before computing metrics and plots.
+
+For `--stage post`, provide `--checkpoint /path/to/checkpoint.pt` so the script can project the sampled `pre` embeddings with the trained `TriModalCLIP` checkpoint, just like the benchmark runner does.
+
+Notes:
+
+- Plots and artifacts are written to `outputs/retrieval/` when `--plot` is provided.
+- The CLI also saves a JSON metrics summary named like `graph_pre_alignment_metrics.json` in the same folder.
+- The alignment CLI reuses the same SQLite-backed loader used during training, so it does not read per-modality `.npy` files directly.
+- For geographic analysis the CLI looks for `data/graph_embeddings/coords.npy` (an `(N,2)` array of latitude,longitude in degrees).
+- The math utilities are intentionally stateless and accept plain `(N, D)` arrays so they can be reused in scripts or notebooks.
+- For large datasets omit `--plot` or subsample beforehand (the CLI will subsample for t-SNE, but pairwise geo/sim computations can be expensive).
+
+If you'd like, I can add a short example notebook that demonstrates loading a small sample and generating all plots.

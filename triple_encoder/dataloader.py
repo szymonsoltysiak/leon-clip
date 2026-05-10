@@ -30,6 +30,8 @@ class H3TripleDataset(Dataset):
         target_resolutions: tuple[int, ...] = (7, 8, 9),
         ancestor_resolutions: tuple[int, ...] = (7,),
         hierarchy_for: tuple[str, ...] = ("text", "graph"),
+        active_modalities: tuple[str, ...] | None = None,
+        require_modalities: tuple[str, ...] = (),
         embedding_sample_strategy: str = "random",
         mask_value: float = 0.0,
         dtype: torch.dtype = torch.float32,
@@ -44,6 +46,14 @@ class H3TripleDataset(Dataset):
                 raise ValueError(f"Invalid ancestor resolution: {resolution}")
 
         self.hierarchy_for = set(hierarchy_for)
+        self.active_modalities = set(active_modalities or ("text", "image", "graph"))
+        unknown_modalities = self.active_modalities.difference({"text", "image", "graph"})
+        if unknown_modalities:
+            raise ValueError(f"Unsupported active modalities: {sorted(unknown_modalities)}")
+        self.require_modalities = tuple(sorted(set(require_modalities)))
+        unknown_required = set(self.require_modalities).difference({"text", "image", "graph"})
+        if unknown_required:
+            raise ValueError(f"Unsupported required modalities: {sorted(unknown_required)}")
         self.embedding_sample_strategy = str(embedding_sample_strategy)
         if self.embedding_sample_strategy not in {"random", "first", "mean"}:
             raise ValueError("embedding_sample_strategy must be one of: random, first, mean")
@@ -93,6 +103,26 @@ class H3TripleDataset(Dataset):
                 has_parent = parent is not None and parent in available_cells
                 has_child = any(child in available_cells for child in self._children_map[h3_id])
                 self._hierarchy_presence_map[modality][h3_id] = bool(has_center or has_parent or has_child)
+
+        if self.require_modalities:
+            kept: list[str] = []
+            for h3_id in self.h3_ids:
+                if all(self._is_present_for_loss(modality, h3_id) for modality in self.require_modalities):
+                    kept.append(h3_id)
+            kept_set = set(kept)
+            self.h3_ids = kept
+            self._h3_resolution = {h: self._h3_resolution[h] for h in kept}
+            self._parent_map = {h: self._parent_map[h] for h in kept}
+            self._children_map = {h: self._children_map[h] for h in kept}
+            self._ancestor_map = {h: self._ancestor_map[h] for h in kept}
+            self._exact_presence_map = {
+                modality: {h: presence[h] for h in kept_set}
+                for modality, presence in self._exact_presence_map.items()
+            }
+            self._hierarchy_presence_map = {
+                modality: {h: presence[h] for h in kept_set}
+                for modality, presence in self._hierarchy_presence_map.items()
+            }
 
         self._image_h3_ids = {h3_id for h3_id in self.h3_ids if self._exact_presence_map["image"][h3_id]}
         self.has_image_indices = [index for index, h3_id in enumerate(self.h3_ids) if h3_id in self._image_h3_ids]
@@ -182,25 +212,44 @@ class H3TripleDataset(Dataset):
     def _hierarchy_present(self, modality: str, h3_id: str) -> bool:
         return self._hierarchy_presence_map[modality][h3_id]
 
+    def _is_present_for_loss(self, modality: str, h3_id: str) -> bool:
+        if modality in self.hierarchy_for:
+            return self._hierarchy_presence_map[modality][h3_id]
+        return self._exact_presence_map[modality][h3_id]
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         h3_id = self.h3_ids[idx]
         h3_resolution = self._h3_resolution[h3_id]
 
-        if "text" in self.hierarchy_for:
+        if "text" not in self.active_modalities:
+            dim = self.text_dim * 3 if "text" in self.hierarchy_for else self.text_dim
+            text_vec = self._zero(dim, "text_inactive")
+            text_present = False
+        elif "text" in self.hierarchy_for:
             text_vec = self._hierarchical("text", h3_id, self.text_dim)
+            text_present = self._hierarchy_present("text", h3_id)
         else:
             text_vec = self._get_or_zero("text", h3_id, self.text_dim)
+            text_present = self._exact_presence_map["text"][h3_id]
 
-        if "graph" in self.hierarchy_for:
+        if "graph" not in self.active_modalities:
+            dim = self.graph_dim * 3 if "graph" in self.hierarchy_for else self.graph_dim
+            graph_vec = self._zero(dim, "graph_inactive")
+            graph_present = False
+        elif "graph" in self.hierarchy_for:
             graph_vec = self._hierarchical("graph", h3_id, self.graph_dim)
+            graph_present = self._hierarchy_present("graph", h3_id)
         else:
             graph_vec = self._get_or_zero("graph", h3_id, self.graph_dim)
+            graph_present = self._exact_presence_map["graph"][h3_id]
 
-        image_vec = self._get_or_zero("image", h3_id, self.image_dim)
-        image_present = self._exact_presence_map["image"][h3_id]
-
-        text_present = self._hierarchy_present("text", h3_id) if "text" in self.hierarchy_for else self._exact_presence_map["text"][h3_id]
-        graph_present = self._hierarchy_present("graph", h3_id) if "graph" in self.hierarchy_for else self._exact_presence_map["graph"][h3_id]
+        if "image" not in self.active_modalities:
+            dim = self.image_dim * 3 if "image" in self.hierarchy_for else self.image_dim
+            image_vec = self._zero(dim, "image_inactive")
+            image_present = False
+        else:
+            image_vec = self._get_or_zero("image", h3_id, self.image_dim)
+            image_present = self._exact_presence_map["image"][h3_id]
 
         item: Dict[str, Any] = {
             "h3": h3_id,

@@ -6,3 +6,11 @@ h3>=4.1
 wandb>=0.16
 tqdm>=4.66
 pytest>=8.0
+python run_downstream_benchmarks.py \
+  --task philadelphia_crime \
+  --feature-mode post_projection \
+  --modalities graph \
+  --probe-model mlp \
+  --mlp-hidden-layers 512,256 \
+  --mlp-max-iter 1000 \
+  --checkpoint checkpoints/Run_BS1024_Dim4096/tri_clip_epoch_10.pt

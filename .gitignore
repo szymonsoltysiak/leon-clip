@@ -7,3 +7,5 @@
 *.pyd
 *.pt
 /checkpoints
+/outputs
+/.pytest_cache

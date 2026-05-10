@@ -57,6 +57,15 @@ def parse_int_tuple(raw: str) -> tuple[int, ...]:
     return tuple(sorted({int(item) for item in values}))
 
 
+def parse_modality_tuple(raw: str) -> tuple[str, ...]:
+    values = [item.strip().lower() for item in str(raw).split(",") if item.strip()]
+    allowed = {"text", "image", "graph"}
+    invalid = [value for value in values if value not in allowed]
+    if invalid:
+        raise ValueError(f"Unsupported modality values: {invalid}")
+    return tuple(sorted(set(values)))
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train tri-modal CLIP model")
     parser.add_argument("--embeddings-root", type=str, default="data")
@@ -68,6 +77,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--min-image-ratio", type=float, default=0.25)
     parser.add_argument("--target-resolutions", type=str, default="7,8,9")
+    parser.add_argument(
+        "--require-modalities",
+        type=str,
+        default="text,image,graph",
+        help="Comma-separated modalities each retained cell must have present "
+        "(text/graph use hierarchical presence, image uses exact). Pass an empty "
+        "string to disable filtering and keep the full union of cells.",
+    )
 
     parser.add_argument("--training-mode", type=str, default="improved", choices=["baseline", "improved"])
 
@@ -389,6 +406,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     target_resolutions = parse_target_resolutions(args.target_resolutions)
     ancestor_resolutions = parse_int_tuple(str(args.cross_resolution_ancestor_res))
+    require_modalities = parse_modality_tuple(args.require_modalities)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dropout_generator = torch.Generator(device="cpu")
@@ -400,9 +418,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             store=store,
             target_resolutions=target_resolutions,
             ancestor_resolutions=ancestor_resolutions,
+            require_modalities=require_modalities,
         )
         if len(dataset) == 0:
-            raise RuntimeError(f"No H3 samples found under {args.embeddings_root}")
+            raise RuntimeError(
+                f"No H3 samples remain after require_modalities={require_modalities!r} filter "
+                f"(embeddings_root={args.embeddings_root})"
+            )
+        LOGGER.info(
+            "Dataset built: %d cells (require_modalities=%s)",
+            len(dataset),
+            require_modalities or "()",
+        )
 
         train_indices, val_indices = split_indices(len(dataset), args.val_split, args.seed)
         train_dataset = Subset(dataset, train_indices)
